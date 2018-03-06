@@ -18,8 +18,10 @@
 #include <limits>
 #include <algorithm>
 #include "../common/common.h"
+#include "../common/host_device_vector.h"
 #include "../common/random.h"
 #include "gbtree_model.h"
+#include "../common/timer.h"
 
 namespace xgboost {
 namespace gbm {
@@ -158,6 +160,7 @@ class GBTree : public GradientBooster {
     // configure predictor
     predictor = std::unique_ptr<Predictor>(Predictor::Create(tparam.predictor));
     predictor->Init(cfg, cache_);
+    monitor.Init("GBTree", tparam.debug_verbose);
   }
 
   void Load(dmlc::Stream* fi) override {
@@ -178,41 +181,42 @@ class GBTree : public GradientBooster {
   }
 
   void DoBoost(DMatrix* p_fmat,
-               std::vector<bst_gpair>* in_gpair,
+               HostDeviceVector<bst_gpair>* in_gpair,
                ObjFunction* obj) override {
-    const std::vector<bst_gpair>& gpair = *in_gpair;
     std::vector<std::vector<std::unique_ptr<RegTree> > > new_trees;
     const int ngroup = model_.param.num_output_group;
+    monitor.Start("BoostNewTrees");
     if (ngroup == 1) {
       std::vector<std::unique_ptr<RegTree> > ret;
-      BoostNewTrees(gpair, p_fmat, 0, &ret);
+      BoostNewTrees(in_gpair, p_fmat, 0, &ret);
       new_trees.push_back(std::move(ret));
     } else {
-      CHECK_EQ(gpair.size() % ngroup, 0U)
+      CHECK_EQ(in_gpair->size() % ngroup, 0U)
           << "must have exactly ngroup*nrow gpairs";
-      std::vector<bst_gpair> tmp(gpair.size() / ngroup);
+      // TODO(canonizer): perform this on GPU if HostDeviceVector has device set.
+      HostDeviceVector<bst_gpair> tmp(in_gpair->size() / ngroup,
+                                      bst_gpair(), in_gpair->device());
+      std::vector<bst_gpair>& gpair_h = in_gpair->data_h();
+      bst_omp_uint nsize = static_cast<bst_omp_uint>(tmp.size());
       for (int gid = 0; gid < ngroup; ++gid) {
-        bst_omp_uint nsize = static_cast<bst_omp_uint>(tmp.size());
+        std::vector<bst_gpair>& tmp_h = tmp.data_h();
         #pragma omp parallel for schedule(static)
         for (bst_omp_uint i = 0; i < nsize; ++i) {
-          tmp[i] = gpair[i * ngroup + gid];
+          tmp_h[i] = gpair_h[i * ngroup + gid];
         }
         std::vector<std::unique_ptr<RegTree> > ret;
-        BoostNewTrees(tmp, p_fmat, gid, &ret);
+        BoostNewTrees(&tmp, p_fmat, gid, &ret);
         new_trees.push_back(std::move(ret));
       }
     }
-    double tstart = dmlc::GetTime();
-    for (int gid = 0; gid < ngroup; ++gid) {
-      this->CommitModel(std::move(new_trees[gid]), gid);
-    }
-    if (tparam.debug_verbose > 0) {
-      LOG(INFO) << "CommitModel(): " << dmlc::GetTime() - tstart << " sec";
-    }
+    monitor.Stop("BoostNewTrees");
+    monitor.Start("CommitModel");
+    this->CommitModel(std::move(new_trees));
+    monitor.Stop("CommitModel");
   }
 
   void PredictBatch(DMatrix* p_fmat,
-               std::vector<bst_float>* out_preds,
+               HostDeviceVector<bst_float>* out_preds,
                unsigned ntree_limit) override {
     predictor->PredictBatch(p_fmat, out_preds, model_, 0, ntree_limit);
   }
@@ -233,8 +237,16 @@ class GBTree : public GradientBooster {
 
   void PredictContribution(DMatrix* p_fmat,
                            std::vector<bst_float>* out_contribs,
-                           unsigned ntree_limit) override {
-    predictor->PredictContribution(p_fmat, out_contribs, model_, ntree_limit);
+                           unsigned ntree_limit, bool approximate, int condition,
+                           unsigned condition_feature) override {
+    predictor->PredictContribution(p_fmat, out_contribs, model_, ntree_limit, approximate);
+  }
+
+  void PredictInteractionContributions(DMatrix* p_fmat,
+                                       std::vector<bst_float>* out_contribs,
+                                       unsigned ntree_limit, bool approximate) override {
+    predictor->PredictInteractionContributions(p_fmat, out_contribs, model_,
+                                               ntree_limit, approximate);
   }
 
   std::vector<std::string> DumpModel(const FeatureMap& fmap,
@@ -255,12 +267,12 @@ class GBTree : public GradientBooster {
       updaters.push_back(std::move(up));
     }
   }
+
   // do group specific group
-  inline void
-  BoostNewTrees(const std::vector<bst_gpair> &gpair,
-                DMatrix *p_fmat,
-                int bst_group,
-                std::vector<std::unique_ptr<RegTree> >* ret) {
+  inline void BoostNewTrees(HostDeviceVector<bst_gpair>* gpair,
+                            DMatrix *p_fmat,
+                            int bst_group,
+                            std::vector<std::unique_ptr<RegTree> >* ret) {
     this->InitUpdater();
     std::vector<RegTree*> new_trees;
     ret->clear();
@@ -283,17 +295,19 @@ class GBTree : public GradientBooster {
       }
     }
     // update the trees
-    for (auto& up : updaters) {
+    for (auto& up : updaters)
       up->Update(gpair, p_fmat, new_trees);
-    }
   }
+
   // commit new trees all at once
   virtual void
-  CommitModel(std::vector<std::unique_ptr<RegTree> >&& new_trees,
-              int bst_group) {
-    model_.CommitModel(std::move(new_trees), bst_group);
-
-    predictor->UpdatePredictionCache(model_, &updaters, new_trees.size());
+  CommitModel(std::vector<std::vector<std::unique_ptr<RegTree>>>&& new_trees) {
+    int num_new_trees = 0;
+    for (int gid = 0; gid < model_.param.num_output_group; ++gid) {
+      num_new_trees += new_trees[gid].size();
+      model_.CommitModel(std::move(new_trees[gid]), gid);
+    }
+    predictor->UpdatePredictionCache(model_, &updaters, num_new_trees);
   }
 
   // --- data structure ---
@@ -308,6 +322,7 @@ class GBTree : public GradientBooster {
   // Cached matrices
   std::vector<std::shared_ptr<DMatrix>> cache_;
   std::unique_ptr<Predictor> predictor;
+  common::Monitor monitor;
 };
 
 // dart
@@ -339,10 +354,10 @@ class Dart : public GBTree {
 
   // predict the leaf scores with dropout if ntree_limit = 0
   void PredictBatch(DMatrix* p_fmat,
-               std::vector<bst_float>* out_preds,
-               unsigned ntree_limit) override {
+                    HostDeviceVector<bst_float>* out_preds,
+                    unsigned ntree_limit) override {
     DropTrees(ntree_limit);
-    PredLoopInternal<Dart>(p_fmat, out_preds, 0, ntree_limit, true);
+    PredLoopInternal<Dart>(p_fmat, &out_preds->data_h(), 0, ntree_limit, true);
   }
 
   void PredictInstance(const SparseBatch::Inst& inst,
@@ -464,20 +479,22 @@ class Dart : public GBTree {
       }
     }
   }
+
   // commit new trees all at once
-  void CommitModel(std::vector<std::unique_ptr<RegTree> >&& new_trees,
-                   int bst_group) override {
-    for (size_t i = 0; i < new_trees.size(); ++i) {
-      model_.trees.push_back(std::move(new_trees[i]));
-      model_.tree_info.push_back(bst_group);
+  void
+  CommitModel(std::vector<std::vector<std::unique_ptr<RegTree>>>&& new_trees) override {
+    int num_new_trees = 0;
+    for (int gid = 0; gid < model_.param.num_output_group; ++gid) {
+      num_new_trees += new_trees[gid].size();
+      model_.CommitModel(std::move(new_trees[gid]), gid);
     }
-    model_.param.num_trees += static_cast<int>(new_trees.size());
-    size_t num_drop = NormalizeTrees(new_trees.size());
+    size_t num_drop = NormalizeTrees(num_new_trees);
     if (dparam.silent != 1) {
       LOG(INFO) << "drop " << num_drop << " trees, "
                 << "weight = " << weight_drop.back();
     }
   }
+
   // predict the leaf scores without dropped trees
   inline bst_float PredValue(const RowBatch::Inst &inst,
                              int bst_group,
@@ -500,16 +517,17 @@ class Dart : public GBTree {
     return psum;
   }
 
-  // select dropped trees
+  // select which trees to drop
   inline void DropTrees(unsigned ntree_limit_drop) {
+    idx_drop.clear();
+    if (ntree_limit_drop > 0) return;
+
     std::uniform_real_distribution<> runif(0.0, 1.0);
     auto& rnd = common::GlobalRandom();
-    // reset
-    idx_drop.clear();
-    // sample dropped trees
     bool skip = false;
     if (dparam.skip_drop > 0.0) skip = (runif(rnd) < dparam.skip_drop);
-    if (ntree_limit_drop == 0 && !skip) {
+    // sample some trees to drop
+    if (!skip) {
       if (dparam.sample_type == 1) {
         bst_float sum_weight = 0.0;
         for (size_t i = 0; i < weight_drop.size(); ++i) {
@@ -544,6 +562,7 @@ class Dart : public GBTree {
       }
     }
   }
+
   // set normalization factors
   inline size_t NormalizeTrees(size_t size_new_trees) {
     float lr = 1.0 * dparam.learning_rate / size_new_trees;

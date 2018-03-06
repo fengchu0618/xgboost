@@ -8,6 +8,8 @@
 
 #include <dmlc/base.h>
 #include <dmlc/omp.h>
+#include <cmath>
+#include <iostream>
 
 /*!
  * \brief string flag for R library, to leave hooks when needed.
@@ -163,26 +165,26 @@ class bst_gpair_internal {
 
   friend std::ostream &operator<<(std::ostream &os,
                                   const bst_gpair_internal<T> &g) {
-    os << g.grad_ << "/" << g.hess_;
+    os << g.GetGrad() << "/" << g.GetHess();
     return os;
   }
 };
 
 template<>
 inline XGBOOST_DEVICE float bst_gpair_internal<int64_t>::GetGrad() const {
-  return grad_ * 1e-5;
+  return grad_ * 1e-4f;
 }
 template<>
 inline XGBOOST_DEVICE float bst_gpair_internal<int64_t>::GetHess() const {
-  return hess_ * 1e-5;
+  return hess_ * 1e-4f;
 }
 template<>
 inline XGBOOST_DEVICE void bst_gpair_internal<int64_t>::SetGrad(float g) {
-  grad_ = g * 1e5;
+  grad_ = static_cast<int64_t>(std::round(g * 1e4));
 }
 template<>
 inline XGBOOST_DEVICE void bst_gpair_internal<int64_t>::SetHess(float h) {
-  hess_ = h * 1e5;
+  hess_ = static_cast<int64_t>(std::round(h * 1e4));
 }
 
 }  // namespace detail
@@ -193,10 +195,10 @@ typedef detail::bst_gpair_internal<float> bst_gpair;
 /*! \brief High precision gradient statistics pair */
 typedef detail::bst_gpair_internal<double> bst_gpair_precise;
 
-  /*! \brief High precision gradient statistics pair with integer backed
-   * storage. Operators are associative where floating point versions are not
-   * associative. */
-  typedef detail::bst_gpair_internal<int64_t> bst_gpair_integer;
+/*! \brief High precision gradient statistics pair with integer backed
+ * storage. Operators are associative where floating point versions are not
+ * associative. */
+typedef detail::bst_gpair_internal<int64_t> bst_gpair_integer;
 
 /*! \brief small eps gap for minimum split decision. */
 const bst_float rt_eps = 1e-6f;

@@ -1,6 +1,7 @@
 cmake_minimum_required (VERSION 3.2)
 project(xgboost)
 include(cmake/Utils.cmake)
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/modules")
 find_package(OpenMP)
 
 set_default_configuration_release()
@@ -8,8 +9,11 @@ msvc_use_static_runtime()
 
 # Options
 option(USE_CUDA  "Build with GPU acceleration") 
+option(USE_AVX  "Build with AVX instructions. May not produce identical results due to approximate math." OFF) 
+option(USE_NCCL "Build using NCCL for multi-GPU. Also requires USE_CUDA") 
 option(JVM_BINDINGS "Build JVM bindings" OFF)
 option(GOOGLE_TEST "Build google tests" OFF)
+option(R_LIB "Build shared library for R package" OFF)
 set(GPU_COMPUTE_VER 35;50;52;60;61 CACHE STRING
   "Space separated list of compute versions to be built against")
 
@@ -22,7 +26,9 @@ endif()
 # Compiler flags
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+if(OpenMP_CXX_FOUND OR OPENMP_FOUND)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   # Multithreaded compilation
@@ -32,6 +38,30 @@ else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_MWAITXINTRIN_H_INCLUDED -D_FORCE_INLINES")
   # Performance
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -funroll-loops")
+endif()
+
+# AVX
+if(USE_AVX)
+  if(MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX")
+  else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx")
+  endif()
+  add_definitions(-DXGBOOST_USE_AVX)
+endif()
+
+
+# compiled code customizations for R package
+if(R_LIB)
+  add_definitions(
+    -DXGBOOST_STRICT_R_MODE=1
+    -DXGBOOST_CUSTOMIZE_GLOBAL_PRNG=1
+    -DDMLC_LOG_BEFORE_THROW=0
+    -DDMLC_DISABLE_STDIN=1
+    -DDMLC_LOG_CUSTOMIZE=1
+    -DRABIT_CUSTOMIZE_MSG_
+    -DRABIT_STRICT_CXX98_
+  )
 endif()
 
 include_directories (
@@ -66,7 +96,7 @@ set(RABIT_EMPTY_SOURCES
     rabit/src/engine_empty.cc
     rabit/src/c_api.cc
 )
-if(MINGW)
+if(MINGW OR R_LIB)
   # build a dummy rabit library
   add_library(rabit STATIC ${RABIT_EMPTY_SOURCES})
 else()
@@ -78,51 +108,103 @@ endif()
 add_subdirectory(dmlc-core)
 set(LINK_LIBRARIES dmlccore rabit)
 
+
 if(USE_CUDA)
-  find_package(CUDA 7.5 REQUIRED)
+  find_package(CUDA 8.0 REQUIRED)
   cmake_minimum_required(VERSION 3.5)
 
   add_definitions(-DXGBOOST_USE_CUDA)
   
-  include_directories(
-    nccl/src
-    cub
-  )
+  include_directories(cub)
 
+  if(USE_NCCL)
+    include_directories(nccl/src)
+    add_definitions(-DXGBOOST_USE_NCCL)
+  endif()
+
+  if((CUDA_VERSION_MAJOR EQUAL 9) OR (CUDA_VERSION_MAJOR GREATER 9))
+    message("CUDA 9.0 detected, adding Volta compute capability (7.0).")
+    set(GPU_COMPUTE_VER "${GPU_COMPUTE_VER};70")
+  endif()
+  
   set(GENCODE_FLAGS "")
   format_gencode_flags("${GPU_COMPUTE_VER}" GENCODE_FLAGS)
-  set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};--expt-extended-lambda;${GENCODE_FLAGS};-lineinfo;")
+  set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};--expt-extended-lambda;--expt-relaxed-constexpr;${GENCODE_FLAGS};-lineinfo;")
   if(NOT MSVC)
     set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};-Xcompiler -fPIC; -std=c++11")
   endif()
 
-  add_subdirectory(nccl)
+  if(USE_NCCL)
+    add_subdirectory(nccl)
+  endif()
+
   cuda_add_library(gpuxgboost ${CUDA_SOURCES} STATIC)
-  target_link_libraries(gpuxgboost nccl)
+  
+  if(USE_NCCL)
+    target_link_libraries(gpuxgboost nccl)
+  endif()
   list(APPEND LINK_LIBRARIES gpuxgboost) 
+endif()
+
+
+# flags and sources for R-package
+if(R_LIB)
+  file(GLOB_RECURSE R_SOURCES
+    R-package/src/*.h
+    R-package/src/*.c
+    R-package/src/*.cc
+  )
+  list(APPEND SOURCES ${R_SOURCES})
 endif()
 
 add_library(objxgboost OBJECT ${SOURCES})
 
-# Executable
-add_executable(runxgboost $<TARGET_OBJECTS:objxgboost> src/cli_main.cc)
-set_target_properties(runxgboost PROPERTIES 
-  OUTPUT_NAME xgboost 
-)
-set_output_directory(runxgboost ${PROJECT_SOURCE_DIR})
-target_link_libraries(runxgboost ${LINK_LIBRARIES})
 
-# Shared library
-add_library(xgboost SHARED $<TARGET_OBJECTS:objxgboost>)
-target_link_libraries(xgboost ${LINK_LIBRARIES})
-set_output_directory(xgboost ${PROJECT_SOURCE_DIR}/lib)
-if(MINGW)
-  # remove the 'lib' prefix to conform to windows convention for shared library names
+# building shared library for R package
+if(R_LIB)
+  find_package(LibR REQUIRED)
+
+  list(APPEND LINK_LIBRARIES "${LIBR_CORE_LIBRARY}")
+  MESSAGE(STATUS "LIBR_CORE_LIBRARY " ${LIBR_CORE_LIBRARY})
+
+  include_directories(
+    "${LIBR_INCLUDE_DIRS}"
+    "${PROJECT_SOURCE_DIR}"
+  )
+
+  # Shared library target for the R package
+  add_library(xgboost SHARED $<TARGET_OBJECTS:objxgboost>)
+  target_link_libraries(xgboost ${LINK_LIBRARIES})
+  # R uses no lib prefix in shared library names of its packages
   set_target_properties(xgboost PROPERTIES PREFIX "")
+
+  setup_rpackage_install_target(xgboost ${CMAKE_CURRENT_BINARY_DIR})
+  # use a dummy location for any other remaining installs
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/dummy_inst")
+
+# main targets: shared library & exe
+else()
+  # Executable
+  add_executable(runxgboost $<TARGET_OBJECTS:objxgboost> src/cli_main.cc)
+  set_target_properties(runxgboost PROPERTIES
+    OUTPUT_NAME xgboost
+  )
+  set_output_directory(runxgboost ${PROJECT_SOURCE_DIR})
+  target_link_libraries(runxgboost ${LINK_LIBRARIES})
+
+  # Shared library
+  add_library(xgboost SHARED $<TARGET_OBJECTS:objxgboost>)
+  target_link_libraries(xgboost ${LINK_LIBRARIES})
+  set_output_directory(xgboost ${PROJECT_SOURCE_DIR}/lib)
+  if(MINGW)
+    # remove the 'lib' prefix to conform to windows convention for shared library names
+    set_target_properties(xgboost PROPERTIES PREFIX "")
+  endif()
+
+  #Ensure these two targets do not build simultaneously, as they produce outputs with conflicting names
+  add_dependencies(xgboost runxgboost)
 endif()
 
-#Ensure these two targets do not build simultaneously, as they produce outputs with conflicting names
-add_dependencies(xgboost runxgboost)
 
 # JVM
 if(JVM_BINDINGS)
@@ -139,14 +221,15 @@ if(JVM_BINDINGS)
         ${JAVA_JVM_LIBRARY})
 endif()
 
+
 # Test
 if(GOOGLE_TEST)
-  enable_testing()
   find_package(GTest REQUIRED)
+  enable_testing()
 
   file(GLOB_RECURSE TEST_SOURCES "tests/cpp/*.cc")
   auto_source_group("${TEST_SOURCES}")
-  include_directories(${GTEST_INCLUDE_DIRS})
+  include_directories(${GTEST_INCLUDE_DIR})
 
   if(USE_CUDA)
     file(GLOB_RECURSE CUDA_TEST_SOURCES "tests/cpp/*.cu")
@@ -157,10 +240,11 @@ if(GOOGLE_TEST)
 
   add_executable(testxgboost ${TEST_SOURCES} ${CUDA_TEST_OBJS} $<TARGET_OBJECTS:objxgboost>)
   set_output_directory(testxgboost ${PROJECT_SOURCE_DIR})
-  target_link_libraries(testxgboost ${GTEST_BOTH_LIBRARIES} ${LINK_LIBRARIES})
+  target_link_libraries(testxgboost ${GTEST_LIBRARIES} ${LINK_LIBRARIES})
 
   add_test(TestXGBoost testxgboost)
 endif()
+
 
 # Group sources
 auto_source_group("${SOURCES}")

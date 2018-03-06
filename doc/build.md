@@ -4,7 +4,7 @@ Installation Guide
 This page gives instructions on how to build and install the xgboost package from
 scratch on various systems. It consists of two steps:
 
-1. First build the shared library from the C++ codes (`libxgboost.so` for linux/osx and `libxgboost.dll` for windows).
+1. First build the shared library from the C++ codes (`libxgboost.so` for Linux/OSX and `xgboost.dll` for Windows).
    - Exception: for R-package installation please directly refer to the R package section.
 2. Then install the language packages (e.g. Python Package).
 
@@ -26,7 +26,7 @@ even better to send pull request if you can fix the problem.
 ## Contents
 - [Build the Shared Library](#build-the-shared-library)
   - [Building on Ubuntu/Debian](#building-on-ubuntu-debian)
-  - [Building on OSX](#building-on-osx)
+  - [Building on macOS](#building-on-macos)
   - [Building on Windows](#building-on-windows)
   - [Building with GPU support](#building-with-gpu-support)
   - [Windows Binaries](#windows-binaries)
@@ -39,7 +39,7 @@ even better to send pull request if you can fix the problem.
 
 Our goal is to build the shared library:
 - On Linux/OSX the target library is `libxgboost.so`
-- On Windows the target library is `libxgboost.dll`
+- On Windows the target library is `xgboost.dll`
 
 The minimal building requirement is
 
@@ -57,40 +57,63 @@ git clone --recursive https://github.com/dmlc/xgboost
 cd xgboost; make -j4
 ```
 
-### Building on OSX
+### Building on macOS
 
-On OSX, one builds xgboost by
+**Install with pip - simple method**
+
+First, make sure you obtained *gcc-5* (newer version does not work with this method yet). Note: installation of `gcc` can take a while (~ 30 minutes)
 
 ```bash
-git clone --recursive https://github.com/dmlc/xgboost
-cd xgboost; cp make/minimum.mk ./config.mk; make -j4
+brew install gcc5
 ```
 
-This builds xgboost without multi-threading, because by default clang in OSX does not come with open-mp.
-See the following paragraph for OpenMP enabled xgboost.
+You might need to run the following command with `sudo` if you run into some permission errors:
 
+```bash
+pip install xgboost
+```
 
-Here is the complete solution to use OpenMP-enabled compilers to install XGBoost.
-Obtain gcc-6.x.x with openmp support by `brew install gcc --without-multilib`. (`brew` is the de facto standard of `apt-get` on OS X. So installing [HPC](http://hpc.sourceforge.net/) separately is not recommended, but it should work.). Installation of `gcc` can take a while (~ 30 minutes)
+**Build from the source code - advanced method**
+
+First, obtain gcc-7.x.x with brew (https://brew.sh/) if you want multi-threaded version, otherwise, Clang is ok if OpenMP / multi-threaded is not required. Note: installation of `gcc` can take a while (~ 30 minutes)
+
+```bash
+brew install gcc
+```
 
 Now, clone the repository
 
 ```bash
 git clone --recursive https://github.com/dmlc/xgboost
+cd xgboost; cp make/config.mk ./config.mk
+```
+
+Open config.mk and uncomment these two lines
+
+```config.mk
+export CC = gcc
+export CXX = g++
+```
+
+and replace these two lines into(5 or 6 or 7; depending on your gcc-version)
+
+```config.mk
+export CC = gcc-7
+export CXX = g++-7
+```
+
+To find your gcc version
+
+```bash
+gcc-version
 ```
 
 and build using the following commands
 
 ```bash
-cd xgboost; cp make/config.mk ./config.mk; make -j4
+make -j4
 ```
-
-NOTE:
-If you use OSX El Capitan, brew installs gcc the latest version gcc-6. So you may need to modify Makefile#L46 and change gcc-5 to gcc-6. After that change gcc-5/g++-5 to gcc-6/g++-6 in make/config.mk then build using the following commands
-
-```bash
-cd xgboost; cp make/config.mk ./config.mk; make -j4
-```
+head over to `Python Package Installation` for the next steps
 
 ### Building on Windows
 You need to first clone the xgboost repo with recursive option clone the submodules.
@@ -110,6 +133,20 @@ All the following steps are in the `Git Bash`.
 
 In MinGW, `make` command comes with the name `mingw32-make`. You can add the following line into the `.bashrc` file.
 
+> if you don't have a MinGW installed on your machine and you are using *Windows x86_64*. try to download one From
+
+> [https://sourceforge.net/projects/mingw-w64/](https://sourceforge.net/projects/mingw-w64/)
+
+> after the installation, add the path of your installation to the system *env* properties.
+
+> the installation path added to your *env* properties should be pointed to the `bin` folder, like:
+
+> `C:\Program Files\mingw-w64\x86_64-7.2.0-posix-seh-rt_v5-rev1\mingw64\bin`
+
+> for users using *Windows 32*, try to find a *mingw32* version instead.
+
+> you are ok to follow the below instructions.
+
 ```bash
 alias make='mingw32-make'
 ```
@@ -128,15 +165,15 @@ cd build
 cmake .. -G"Visual Studio 12 2013 Win64"
 ```
 
-This specifies an out of source build using the MSVC 12 64 bit generator. Open the .sln file in the build directory and build with Visual Studio. To use the Python module you can copy libxgboost.dll into python-package\xgboost.
+This specifies an out of source build using the MSVC 12 64 bit generator. Open the .sln file in the build directory and build with Visual Studio. To use the Python module you can copy `xgboost.dll` into python-package\xgboost.
 
 Other versions of Visual Studio may work but are untested.
 
 ### Building with GPU support
 
-XGBoost can be built with GPU support for both Linux and Windows using cmake. GPU support works with the Python package as well as the CLI version. The R package is not yet supported.
+XGBoost can be built with GPU support for both Linux and Windows using cmake. GPU support works with the Python package as well as the CLI version. See [Installing R package with GPU support](#installing-r-package-with-gpu-support) for special instructions for R.
 
-An up-to-date version of the cuda toolkit is required.
+An up-to-date version of the CUDA toolkit is required.
 
 From the command line on Linux starting from the xgboost directory:
 
@@ -146,7 +183,9 @@ $ cd build
 $ cmake .. -DUSE_CUDA=ON
 $ make -j
 ```
-On Windows using cmake, see what options for Generators you have for cmake, and choose one with [arch] replaced by Win64:
+**Windows requirements** for GPU build: only Visual C++ 2015 or 2013 with CUDA v8.0 were fully tested. Either install Visual C++ 2015 Build Tools separately, or as a part of Visual Studio 2015. If you already have Visual Studio 2017, the Visual C++ 2015 Toolchain componenet has to be installed using the VS 2017 Installer. Likely, you would need to use the VS2015 x64 Native Tools command prompt to run the cmake commands given below. In some situations, however, things run just fine from MSYS2 bash command line.
+
+On Windows, using cmake, see what options for Generators you have for cmake, and choose one with [arch] replaced by Win64:
 ```bash
 cmake -help
 ```
@@ -156,9 +195,17 @@ $ mkdir build
 $ cd build
 $ cmake .. -G"Visual Studio 14 2015 Win64" -DUSE_CUDA=ON
 ```
-Cmake will create an xgboost.sln solution file in the build directory. Build this solution in release mode as a x64 build.
+To speed up compilation, compute version specific to your GPU could be passed to cmake as, e.g., `-DGPU_COMPUTE_VER=50`.
+The above cmake configuration run will create an xgboost.sln solution file in the build directory. Build this solution in release mode as a x64 build, either from Visual studio or from command line:
+```
+cmake --build . --target xgboost --config Release
+```
+If build seems to use only a single process, you might try to append an option like ` -- /m:6` to the above command.
 
 ### Windows Binaries
+
+After the build process successfully ends, you will find a `xgboost.dll` library file inside `./lib/` folder, copy this file to the the API package folder like `python-package/xgboost` if you are using *python* API. And you are good to follow the below instructions.
+
 Unofficial windows binaries and instructions on how to use them are hosted on [Guido Tapia's blog](http://www.picnet.com.au/blogs/guido/post/2016/09/22/xgboost-windows-x64-binaries-for-download/)
 
 ### Customized Building
@@ -273,8 +320,42 @@ setwd('wherever/you/cloned/it/xgboost/R-package/')
 install.packages('.', repos = NULL, type="source")
 ```
 
+The package could also be built and installed with cmake (and Visual C++ 2015 on Windows) using instructions from the next section, but without GPU support (omit the `-DUSE_CUDA=ON` cmake parameter).
+
 If all fails, try [building the shared library](#build-the-shared-library) to see whether a problem is specific to R package or not.
 
+### Installing R package with GPU support
+
+The procedure and requirements are similar as in [Building with GPU support](#building-with-gpu-support), so make sure to read it first.
+
+On Linux, starting from the xgboost directory:
+
+```bash
+mkdir build
+cd build
+cmake .. -DUSE_CUDA=ON -DR_LIB=ON
+make install -j
+```
+When default target is used, an R package shared library would be built in the `build` area.
+The `install` target, in addition, assembles the package files with this shared library under `build/R-package`, and runs `R CMD INSTALL`.
+
+On Windows, cmake with Visual C++ Build Tools (or Visual Studio) has to be used to build an R package with GPU support. Rtools must also be installed (perhaps, some other MinGW distributions with `gendef.exe` and `dlltool.exe` would work, but that was not tested).
+```bash
+mkdir build
+cd build
+cmake .. -G"Visual Studio 14 2015 Win64" -DUSE_CUDA=ON -DR_LIB=ON
+cmake --build . --target install --config Release
+```
+When `--target xgboost` is used, an R package dll would be built under `build/Release`.
+The `--target install`, in addition, assembles the package files with this dll under `build/R-package`, and runs `R CMD INSTALL`.
+
+If cmake can't find your R during the configuration step, you might provide the location of its executable to cmake like this: `-DLIBR_EXECUTABLE="C:/Program Files/R/R-3.4.1/bin/x64/R.exe"`.
+
+If on Windows you get a "permission denied" error when trying to write to ...Program Files/R/... during the package installation, create a `.Rprofile` file in your personal home directory (if you don't already have one in there), and add a line to it which specifies the location of your R packages user library, like the following:
+```r
+.libPaths( unique(c("C:/Users/USERNAME/Documents/R/win-library/3.4", .libPaths())))
+```
+You might find the exact location by running `.libPaths()` in R GUI or RStudio.
 
 ## Trouble Shooting
 

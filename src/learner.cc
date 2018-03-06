@@ -16,8 +16,11 @@
 #include <utility>
 #include <vector>
 #include "./common/common.h"
+#include "./common/host_device_vector.h"
 #include "./common/io.h"
 #include "./common/random.h"
+#include "common/timer.h"
+
 
 namespace xgboost {
 // implementation of base learner.
@@ -145,6 +148,12 @@ class LearnerImpl : public Learner {
     name_gbm_ = "gbtree";
   }
 
+  static void AssertGPUSupport() {
+#ifndef XGBOOST_USE_CUDA
+    LOG(FATAL) << "XGBoost version not compiled with GPU support.";
+#endif
+  }
+
   void ConfigureUpdaters() {
     if (tparam.tree_method == 0 || tparam.tree_method == 1 ||
         tparam.tree_method == 2) {
@@ -165,6 +174,7 @@ class LearnerImpl : public Learner {
                    << "grow_fast_histmaker.";
       cfg_["updater"] = "grow_fast_histmaker";
     } else if (tparam.tree_method == 4) {
+      this->AssertGPUSupport();
       if (cfg_.count("updater") == 0) {
         cfg_["updater"] = "grow_gpu,prune";
       }
@@ -172,6 +182,7 @@ class LearnerImpl : public Learner {
         cfg_["predictor"] = "gpu_predictor";
       }
     } else if (tparam.tree_method == 5) {
+      this->AssertGPUSupport();
       if (cfg_.count("updater") == 0) {
         cfg_["updater"] = "grow_gpu_hist";
       }
@@ -185,6 +196,7 @@ class LearnerImpl : public Learner {
       const std::vector<std::pair<std::string, std::string> >& args) override {
     // add to configurations
     tparam.InitAllowUnknown(args);
+    monitor.Init("Learner", tparam.debug_verbose);
     cfg_.clear();
     for (const auto& kv : args) {
       if (kv.first == "eval_metric") {
@@ -342,29 +354,37 @@ class LearnerImpl : public Learner {
   }
 
   void UpdateOneIter(int iter, DMatrix* train) override {
+    monitor.Start("UpdateOneIter");
     CHECK(ModelInitialized())
         << "Always call InitModel or LoadModel before update";
     if (tparam.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(tparam.seed * kRandSeedMagic + iter);
     }
     this->LazyInitDMatrix(train);
+    monitor.Start("PredictRaw");
     this->PredictRaw(train, &preds_);
-    obj_->GetGradient(preds_, train->info(), iter, &gpair_);
+    monitor.Stop("PredictRaw");
+    monitor.Start("GetGradient");
+    obj_->GetGradient(&preds_, train->info(), iter, &gpair_);
+    monitor.Stop("GetGradient");
     gbm_->DoBoost(train, &gpair_, obj_.get());
+    monitor.Stop("UpdateOneIter");
   }
 
   void BoostOneIter(int iter, DMatrix* train,
-                    std::vector<bst_gpair>* in_gpair) override {
+                    HostDeviceVector<bst_gpair>* in_gpair) override {
+    monitor.Start("BoostOneIter");
     if (tparam.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(tparam.seed * kRandSeedMagic + iter);
     }
     this->LazyInitDMatrix(train);
     gbm_->DoBoost(train, in_gpair);
+    monitor.Stop("BoostOneIter");
   }
 
   std::string EvalOneIter(int iter, const std::vector<DMatrix*>& data_sets,
                           const std::vector<std::string>& data_names) override {
-    double tstart = dmlc::GetTime();
+    monitor.Start("EvalOneIter");
     std::ostringstream os;
     os << '[' << iter << ']' << std::setiosflags(std::ios::fixed);
     if (metrics_.size() == 0) {
@@ -375,13 +395,11 @@ class LearnerImpl : public Learner {
       obj_->EvalTransform(&preds_);
       for (auto& ev : metrics_) {
         os << '\t' << data_names[i] << '-' << ev->Name() << ':'
-           << ev->Eval(preds_, data_sets[i]->info(), tparam.dsplit == 2);
+           << ev->Eval(preds_.data_h(), data_sets[i]->info(), tparam.dsplit == 2);
       }
     }
 
-    if (tparam.debug_verbose > 0) {
-      LOG(INFO) << "EvalOneIter(): " << dmlc::GetTime() - tstart << " sec";
-    }
+    monitor.Stop("EvalOneIter");
     return os.str();
   }
 
@@ -420,16 +438,20 @@ class LearnerImpl : public Learner {
     this->PredictRaw(data, &preds_);
     obj_->EvalTransform(&preds_);
     return std::make_pair(metric,
-                          ev->Eval(preds_, data->info(), tparam.dsplit == 2));
+                          ev->Eval(preds_.data_h(), data->info(), tparam.dsplit == 2));
   }
 
   void Predict(DMatrix* data, bool output_margin,
-               std::vector<bst_float>* out_preds, unsigned ntree_limit,
-               bool pred_leaf, bool pred_contribs) const override {
+               HostDeviceVector<bst_float>* out_preds, unsigned ntree_limit,
+               bool pred_leaf, bool pred_contribs, bool approx_contribs,
+               bool pred_interactions) const override {
     if (pred_contribs) {
-      gbm_->PredictContribution(data, out_preds, ntree_limit);
+      gbm_->PredictContribution(data, &out_preds->data_h(), ntree_limit, approx_contribs);
+    } else if (pred_interactions) {
+      gbm_->PredictInteractionContributions(data, &out_preds->data_h(), ntree_limit,
+                                            approx_contribs);
     } else if (pred_leaf) {
-      gbm_->PredictLeaf(data, out_preds, ntree_limit);
+      gbm_->PredictLeaf(data, &out_preds->data_h(), ntree_limit);
     } else {
       this->PredictRaw(data, out_preds, ntree_limit);
       if (!output_margin) {
@@ -443,17 +465,18 @@ class LearnerImpl : public Learner {
   // if not, initialize the column access.
   inline void LazyInitDMatrix(DMatrix* p_train) {
     if (tparam.tree_method == 3 || tparam.tree_method == 4 ||
-        tparam.tree_method == 5) {
+        tparam.tree_method == 5 || name_gbm_ == "gblinear") {
       return;
     }
 
-    if (!p_train->HaveColAccess()) {
+    monitor.Start("LazyInitDMatrix");
+    if (!p_train->HaveColAccess(true)) {
       int ncol = static_cast<int>(p_train->info().num_col);
       std::vector<bool> enabled(ncol, true);
       // set max row per batch to limited value
       // in distributed mode, use safe choice otherwise
       size_t max_row_perbatch = tparam.max_row_perbatch;
-      const size_t safe_max_row = static_cast<size_t>(32UL << 10UL);
+      const size_t safe_max_row = static_cast<size_t>(32ul << 10ul);
 
       if (tparam.tree_method == 0 && p_train->info().num_row >= (4UL << 20UL)) {
         LOG(CONSOLE)
@@ -473,7 +496,7 @@ class LearnerImpl : public Learner {
         max_row_perbatch = std::min(max_row_perbatch, safe_max_row);
       }
       // initialize column access
-      p_train->InitColAccess(enabled, tparam.prob_buffer_row, max_row_perbatch);
+      p_train->InitColAccess(enabled, tparam.prob_buffer_row, max_row_perbatch, true);
     }
 
     if (!p_train->SingleColBlock() && cfg_.count("updater") == 0) {
@@ -487,6 +510,7 @@ class LearnerImpl : public Learner {
         gbm_->Configure(cfg_.begin(), cfg_.end());
       }
     }
+    monitor.Stop("LazyInitDMatrix");
   }
 
   // return whether model is already initialized.
@@ -523,12 +547,13 @@ class LearnerImpl : public Learner {
    * \param ntree_limit limit number of trees used for boosted tree
    *   predictor, when it equals 0, this means we are using all the trees
    */
-  inline void PredictRaw(DMatrix* data, std::vector<bst_float>* out_preds,
+  inline void PredictRaw(DMatrix* data, HostDeviceVector<bst_float>* out_preds,
                          unsigned ntree_limit = 0) const {
     CHECK(gbm_.get() != nullptr)
         << "Predict must happen after Load or InitModel";
     gbm_->PredictBatch(data, out_preds, ntree_limit);
   }
+
   // model parameter
   LearnerModelParam mparam;
   // training parameter
@@ -542,15 +567,17 @@ class LearnerImpl : public Learner {
   // name of objective function
   std::string name_obj_;
   // temporal storages for prediction
-  std::vector<bst_float> preds_;
+  HostDeviceVector<bst_float> preds_;
   // gradient pairs
-  std::vector<bst_gpair> gpair_;
+  HostDeviceVector<bst_gpair> gpair_;
 
  private:
   /*! \brief random number transformation seed. */
   static const int kRandSeedMagic = 127;
   // internal cached dmatrix
   std::vector<std::shared_ptr<DMatrix> > cache_;
+
+  common::Monitor monitor;
 };
 
 Learner* Learner::Create(

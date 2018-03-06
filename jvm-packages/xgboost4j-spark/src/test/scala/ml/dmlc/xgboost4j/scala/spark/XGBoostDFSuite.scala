@@ -24,8 +24,9 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.DataTypes
 import org.scalatest.FunSuite
+import org.scalatest.prop.TableDrivenPropertyChecks
 
-class XGBoostDFSuite extends FunSuite with PerTest {
+class XGBoostDFSuite extends FunSuite with PerTest with TableDrivenPropertyChecks {
   private def buildDataFrame(
       labeledPoints: Seq[XGBLabeledPoint],
       numPartitions: Int = numWorkers): DataFrame = {
@@ -201,7 +202,8 @@ class XGBoostDFSuite extends FunSuite with PerTest {
     val trainingDfWithMargin = trainingDf.withColumn("margin", functions.rand())
     val testRDD = sc.parallelize(Classification.test.map(_.features))
     val paramMap = Map("eta" -> "1", "max_depth" -> "6", "silent" -> "1",
-      "objective" -> "binary:logistic", "baseMarginCol" -> "margin")
+      "objective" -> "binary:logistic", "baseMarginCol" -> "margin",
+      "testTrainSplit" -> 0.5)
 
     def trainPredict(df: Dataset[_]): Array[Float] = {
       XGBoost.trainWithDataFrame(df, paramMap, round = 1, nWorkers = numWorkers)
@@ -233,5 +235,31 @@ class XGBoostDFSuite extends FunSuite with PerTest {
 
     // The predictions heavily relies on the first training instance, and thus are very close.
     predictions.foreach(pred => assert(math.abs(pred - predictions.head) <= 0.01f))
+  }
+
+  test("training summary") {
+    val paramMap = List("eta" -> "1", "max_depth" -> "6", "silent" -> "1",
+      "objective" -> "binary:logistic").toMap
+
+    val trainingDf = buildDataFrame(Classification.train)
+    val model = XGBoost.trainWithDataFrame(trainingDf, paramMap, round = 5,
+      nWorkers = numWorkers)
+
+    assert(model.summary.trainObjectiveHistory.length === 5)
+    assert(model.summary.testObjectiveHistory.isEmpty)
+  }
+
+  test("train/test split") {
+    val paramMap = Map("eta" -> "1", "max_depth" -> "6", "silent" -> "1",
+      "objective" -> "binary:logistic", "trainTestRatio" -> "0.5")
+    val trainingDf = buildDataFrame(Classification.train)
+
+    forAll(Table("useExternalMemory", false, true)) { useExternalMemory =>
+      val model = XGBoost.trainWithDataFrame(trainingDf, paramMap, round = 5,
+        nWorkers = numWorkers, useExternalMemory = useExternalMemory)
+      val Some(testObjectiveHistory) = model.summary.testObjectiveHistory
+      assert(testObjectiveHistory.length === 5)
+      assert(model.summary.trainObjectiveHistory !== testObjectiveHistory)
+    }
   }
 }

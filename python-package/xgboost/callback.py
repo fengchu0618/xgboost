@@ -50,7 +50,7 @@ def print_evaluation(period=1, show_stdv=True):
     """
     def callback(env):
         """internal function"""
-        if env.rank != 0 or len(env.evaluation_result_list) == 0 or period is False:
+        if env.rank != 0 or len(env.evaluation_result_list) == 0 or period is False or period == 0:
             return
         i = env.iteration
         if (i % period == 0 or i + 1 == env.begin_iteration or i + 1 == env.end_iteration):
@@ -111,8 +111,8 @@ def reset_learning_rate(learning_rates):
         or a customized function that calculates eta in terms of
         current number of round and the total number of boosting round (e.g. yields
         learning rate decay)
-        - list l: eta = l[boosting round]
-        - function f: eta = f(boosting round, num_boost_round)
+        - list l: eta = l[boosting_round]
+        - function f: eta = f(boosting_round, num_boost_round)
 
     Returns
     -------
